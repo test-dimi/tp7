@@ -310,7 +310,14 @@ async fn upload_replacement_file(
         .map_err(map_mtp_error)
     {
         cleanup_uploaded_temp(storage, temporary_handle).await;
-        let _ = storage.rename(existing.handle, &destination.name).await;
+        if let Err(restore_error) = storage.rename(existing.handle, &destination.name).await {
+            return Err(AppError::Mtp {
+                message: format!(
+                    "could not finish replacing {} ({error}); the original is kept as {} because renaming it back also failed: {restore_error}",
+                    destination.path, backup.path
+                ),
+            });
+        }
         return Err(error);
     }
 
@@ -344,11 +351,36 @@ async fn upload_file(
             );
             ControlFlow::Continue(())
         })
-        .await
-        .map_err(|error| map_mtp_error(error.into()));
+        .await;
 
     finish_progress(options.progress);
-    result
+    match result {
+        Ok(handle) => Ok(handle),
+        Err(error) => Err(discard_partial_upload(storage, destination, error).await),
+    }
+}
+
+/// A failed data phase can leave a truncated object on the TP-7 under the
+/// name being uploaded. Delete it, so a failed push never looks like a
+/// finished file, and say so in the error when the delete fails too.
+async fn discard_partial_upload(
+    storage: &Storage,
+    destination: &RemoteDestination,
+    error: mtp_rs::UploadError,
+) -> AppError {
+    let Some(partial) = error.partial else {
+        return map_mtp_error(error.source);
+    };
+
+    match storage.delete(partial).await {
+        Ok(()) => map_mtp_error(error.source),
+        Err(delete_error) => AppError::Mtp {
+            message: format!(
+                "upload of {} failed ({}), and the partial file left on the TP-7 could not be removed ({delete_error}); delete it with `tp7 -a rm {}`",
+                destination.path, error.source, destination.path
+            ),
+        },
+    }
 }
 
 async fn resolve_file_destination(

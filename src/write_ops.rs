@@ -1,11 +1,13 @@
+use std::collections::HashSet;
+
 use mtp_rs::{ObjectHandle, ObjectInfo, Storage};
 use serde::{Deserialize, Serialize};
 
 use crate::mtp_session::{MtpOpenPolicy, block_on, map_mtp_error, open_mtp_session};
 use crate::output::AppError;
 use crate::remote::{
-    RemoteObject, RemoteTarget, first_storage, format_path, join_remote_path, list_object_infos,
-    path_components, resolve_path,
+    ObjectKind, RemoteObject, RemoteTarget, check_folder_descent, first_storage, format_path,
+    join_remote_path, list_object_infos, path_components, resolve_path,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +28,27 @@ pub struct RmReport {
     pub path: String,
     pub dry_run: bool,
     pub removed: Vec<RemoteObject>,
+    /// Everything inside a removed folder. The TP-7 deletes a folder and its
+    /// contents in one call, so this is the only place they are listed.
+    pub contents: Vec<RmContentEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RmContentEntry {
+    pub path: String,
+    pub object: RemoteObject,
+}
+
+impl RmReport {
+    /// Files inside the removed folder and their total size in bytes.
+    pub fn content_totals(&self) -> (usize, u64) {
+        self.contents
+            .iter()
+            .filter(|entry| entry.object.kind == ObjectKind::File)
+            .fold((0, 0), |(count, bytes), entry| {
+                (count + 1, bytes + entry.object.size)
+            })
+    }
 }
 
 pub fn run_mkdir(
@@ -195,6 +218,7 @@ async fn write_rm(
                 path: remote_path.to_string(),
                 dry_run,
                 removed: Vec::new(),
+                contents: Vec::new(),
             });
         }
         Err(error) => return Err(error),
@@ -209,6 +233,11 @@ async fn write_rm(
         });
     }
 
+    let contents = if object.is_folder() {
+        collect_folder_contents(&storage, object.handle, &resolved.path).await?
+    } else {
+        Vec::new()
+    };
     let removed = vec![RemoteObject::from_object(object.clone())];
     if !dry_run {
         storage.delete(object.handle).await.map_err(map_mtp_error)?;
@@ -218,7 +247,48 @@ async fn write_rm(
         path: resolved.path,
         dry_run,
         removed,
+        contents,
     })
+}
+
+/// Lists everything below `folder`, depth first, so `rm --recursive` can show
+/// exactly what the single folder delete will take with it.
+async fn collect_folder_contents(
+    storage: &Storage,
+    folder: ObjectHandle,
+    folder_path: &str,
+) -> Result<Vec<RmContentEntry>, AppError> {
+    let mut visited = HashSet::from([folder]);
+    let mut entries = Vec::new();
+    let mut stack = list_object_infos(storage, Some(folder))
+        .await?
+        .into_iter()
+        .rev()
+        .map(|object| (object, 1, folder_path.to_string()))
+        .collect::<Vec<_>>();
+
+    while let Some((object, depth, parent_path)) = stack.pop() {
+        let path = join_remote_path(&parent_path, &object.filename);
+        let handle = object.handle;
+        let is_folder = object.is_folder();
+        entries.push(RmContentEntry {
+            path: path.clone(),
+            object: RemoteObject::from_object(object),
+        });
+
+        if is_folder {
+            check_folder_descent(&mut visited, handle, depth, &path)?;
+            let children = list_object_infos(storage, Some(handle)).await?;
+            stack.extend(
+                children
+                    .into_iter()
+                    .rev()
+                    .map(|child| (child, depth + 1, path.clone())),
+            );
+        }
+    }
+
+    Ok(entries)
 }
 
 async fn find_child(

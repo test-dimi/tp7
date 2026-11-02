@@ -240,21 +240,41 @@ mod platform {
     }
 
     fn find_tp7_source() -> Result<Source, AppError> {
-        Sources
-            .into_iter()
-            .find(is_tp7_endpoint)
-            .ok_or_else(|| AppError::Midi {
-                message: "No TP-7 CoreMIDI source endpoint was found.".to_string(),
-            })
+        single_tp7_endpoint(
+            Sources.into_iter().filter(is_tp7_endpoint).collect(),
+            "sources",
+            "No TP-7 CoreMIDI source endpoint was found.",
+        )
     }
 
     fn find_tp7_destination() -> Result<Destination, AppError> {
-        Destinations
-            .into_iter()
-            .find(is_tp7_endpoint)
-            .ok_or_else(|| AppError::Midi {
-                message: "No TP-7 CoreMIDI destination endpoint was found.".to_string(),
-            })
+        single_tp7_endpoint(
+            Destinations.into_iter().filter(is_tp7_endpoint).collect(),
+            "destinations",
+            "No TP-7 CoreMIDI destination endpoint was found.",
+        )
+    }
+
+    /// The mode switch must reach exactly one recorder. With two TP-7s, or a
+    /// virtual MIDI port that also carries the name, refuse instead of
+    /// guessing. The ambiguity message avoids the "endpoint" wording that
+    /// `mtp_session` treats as a transient, retryable absence.
+    fn single_tp7_endpoint<T>(
+        mut matches: Vec<T>,
+        kind: &str,
+        missing: &str,
+    ) -> Result<T, AppError> {
+        match matches.len() {
+            0 => Err(AppError::Midi {
+                message: missing.to_string(),
+            }),
+            1 => Ok(matches.remove(0)),
+            count => Err(AppError::Midi {
+                message: format!(
+                    "Found {count} MIDI {kind} named TP-7, so tp7 can't tell which recorder to switch. Disconnect the other TP-7 or rename the other MIDI port, then retry."
+                ),
+            }),
+        }
     }
 
     fn is_tp7_endpoint<T>(endpoint: &T) -> bool
@@ -418,6 +438,19 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn refuses_ambiguous_midi_ports() {
+            assert_eq!(single_tp7_endpoint(vec![1], "sources", "none").unwrap(), 1);
+            assert!(single_tp7_endpoint::<u8>(Vec::new(), "sources", "none").is_err());
+
+            let error = single_tp7_endpoint(vec![1, 2], "sources", "none").unwrap_err();
+            let AppError::Midi { message } = error else {
+                panic!("expected a MIDI error");
+            };
+            assert!(message.starts_with("Found 2 MIDI sources"));
+            assert!(!message.contains("endpoint"));
+        }
 
         #[test]
         fn packs_and_unpacks_7bit_payload() {

@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use mtp_rs::{ByteRange, DEFAULT_CANCEL_TIMEOUT, ObjectHandle, ObjectInfo, Storage};
 use serde::{Deserialize, Serialize};
@@ -8,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use crate::mtp_session::{MtpOpenPolicy, block_on, map_mtp_error, open_mtp_session};
 use crate::output::AppError;
 use crate::remote::{
-    RemoteTarget, first_storage, join_remote_path, list_object_infos, resolve_path,
+    RemoteTarget, check_folder_descent, first_storage, join_remote_path, list_object_infos,
+    resolve_path,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -149,6 +152,7 @@ async fn pull_folder(
         create_dir_all(root_local_path)?;
     }
 
+    let mut visited = HashSet::from([root_handle]);
     let mut stack = list_object_infos(storage, Some(root_handle))
         .await?
         .into_iter()
@@ -156,17 +160,19 @@ async fn pull_folder(
         .map(|object| {
             (
                 object,
+                1,
                 root_remote_path.to_string(),
                 root_local_path.to_path_buf(),
             )
         })
         .collect::<Vec<_>>();
 
-    while let Some((object, remote_parent_path, local_parent_path)) = stack.pop() {
+    while let Some((object, depth, remote_parent_path, local_parent_path)) = stack.pop() {
         let remote_path = join_remote_path(&remote_parent_path, &object.filename);
         let local_path = safe_child_path(&local_parent_path, &object.filename)?;
 
         if object.is_folder() {
+            check_folder_descent(&mut visited, object.handle, depth, &remote_path)?;
             if !options.dry_run {
                 create_dir_all(&local_path)?;
             }
@@ -176,7 +182,7 @@ async fn pull_folder(
                 children
                     .into_iter()
                     .rev()
-                    .map(|child| (child, remote_path.clone(), local_path.clone())),
+                    .map(|child| (child, depth + 1, remote_path.clone(), local_path.clone())),
             );
         } else {
             pull_file(storage, object, &remote_path, &local_path, options, report).await?;
@@ -218,13 +224,20 @@ async fn pull_file(
             Ok(())
         }
         PullStatus::Downloaded => {
-            let temp = TempDownload::new(local_path)?;
-            download_to_path(storage, object.handle, object.size, temp.path(), options).await?;
+            let (temp, file) = TempDownload::create(local_path)?;
+            download_to_file(
+                storage,
+                object.handle,
+                object.size,
+                file,
+                temp.path(),
+                options,
+            )
+            .await?;
+            // Check the finished download before it replaces anything, so a short
+            // transfer can never cost the user an existing local copy.
+            verify_file_size(temp.path(), object.size)?;
             rename_file(temp.path(), local_path)?;
-            if let Err(error) = verify_file_size(local_path, object.size) {
-                let _ = fs::remove_file(local_path);
-                return Err(error);
-            }
 
             report.downloaded += 1;
             report.total_bytes += object.size;
@@ -239,10 +252,11 @@ async fn pull_file(
     }
 }
 
-async fn download_to_path(
+async fn download_to_file(
     storage: &Storage,
     handle: ObjectHandle,
     expected_size: u64,
+    mut file: File,
     local_path: &Path,
     options: PullOptions,
 ) -> Result<(), AppError> {
@@ -250,7 +264,6 @@ async fn download_to_path(
         .download(handle, ByteRange::Full)
         .await
         .map_err(map_mtp_error)?;
-    let mut file = create_file(local_path)?;
 
     while let Some(chunk) = download.next_chunk().await {
         let bytes = match chunk {
@@ -271,6 +284,8 @@ async fn download_to_path(
 
     finish_progress(options.progress);
     file.flush().map_err(|error| io_error(local_path, error))?;
+    file.sync_all()
+        .map_err(|error| io_error(local_path, error))?;
     Ok(())
 }
 
@@ -349,30 +364,60 @@ fn safe_child_path(parent: &Path, name: &str) -> Result<PathBuf, AppError> {
     Ok(parent.join(name))
 }
 
-fn temp_download_path(local_path: &Path) -> Result<PathBuf, AppError> {
+/// How many differently named temp files to try before giving up.
+const TEMP_CREATE_ATTEMPTS: u32 = 16;
+
+fn temp_download_path(local_path: &Path, attempt: u32) -> Result<PathBuf, AppError> {
     let Some(file_name) = local_path.file_name() else {
         return Err(AppError::InvalidArguments {
             message: "local path must include a file name".to_string(),
         });
     };
-    let temp_name = format!(".{}.tp7tmp", file_name.to_string_lossy());
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp_name = format!(
+        ".{}.{}-{stamp}-{attempt}.tp7tmp",
+        file_name.to_string_lossy(),
+        std::process::id()
+    );
 
     Ok(local_path.with_file_name(temp_name))
 }
 
-/// Owns the partial download and deletes it on drop, so a failed or
-/// interrupted transfer never leaves a `.tp7tmp` file next to the
-/// destination. A completed download renames the file away first, which
-/// turns the cleanup into a no-op.
+/// Owns the partial download and deletes it on drop, so a failed transfer
+/// never leaves a `.tp7tmp` file next to the destination. A completed
+/// download renames the file away first, which turns the cleanup into a
+/// no-op. The file is created exclusively under a unique name, so it never
+/// truncates or follows anything already on disk. A process killed by a
+/// signal (Ctrl-C) skips `Drop` and can leave the hidden temp file behind.
 struct TempDownload {
     path: PathBuf,
 }
 
 impl TempDownload {
-    fn new(local_path: &Path) -> Result<Self, AppError> {
-        Ok(Self {
-            path: temp_download_path(local_path)?,
-        })
+    fn create(local_path: &Path) -> Result<(Self, File), AppError> {
+        if let Some(parent) = local_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            create_dir_all(parent)?;
+        }
+
+        let mut attempt = 0;
+        loop {
+            let path = temp_download_path(local_path, attempt)?;
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((Self { path }, file)),
+                Err(error)
+                    if error.kind() == io::ErrorKind::AlreadyExists
+                        && attempt + 1 < TEMP_CREATE_ATTEMPTS =>
+                {
+                    attempt += 1;
+                }
+                Err(error) => return Err(io_error(&path, error)),
+            }
+        }
     }
 
     fn path(&self) -> &Path {
@@ -462,21 +507,6 @@ fn file_report(
     }
 }
 
-fn create_file(path: &Path) -> Result<File, AppError> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        create_dir_all(parent)?;
-    }
-
-    OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| io_error(path, error))
-}
-
 fn create_dir_all(path: &Path) -> Result<(), AppError> {
     fs::create_dir_all(path).map_err(|error| io_error(path, error))
 }
@@ -540,11 +570,15 @@ mod tests {
     }
 
     #[test]
-    fn builds_temp_download_path_next_to_destination() {
-        assert_eq!(
-            temp_download_path(Path::new("out/take.wav")).unwrap(),
-            PathBuf::from("out/.take.wav.tp7tmp")
-        );
+    fn builds_unique_hidden_temp_path_next_to_destination() {
+        let first = temp_download_path(Path::new("out/take.wav"), 0).unwrap();
+        let second = temp_download_path(Path::new("out/take.wav"), 1).unwrap();
+        let name = first.file_name().unwrap().to_string_lossy().to_string();
+
+        assert_eq!(first.parent(), Some(Path::new("out")));
+        assert!(name.starts_with(".take.wav."));
+        assert!(name.ends_with(".tp7tmp"));
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -639,27 +673,45 @@ mod tests {
     }
 
     #[test]
-    fn detects_size_mismatch() {
-        let path = Path::new("target/tp7-unit-size-mismatch.tmp");
-        let temp = TempDownload::new(path).unwrap();
-        let temp_path = temp.path().to_path_buf();
-        fs::write(&temp_path, b"abc").unwrap();
-        rename_file(&temp_path, path).unwrap();
+    fn detects_size_mismatch_on_the_temp_file() {
+        let path = Path::new("target/tp7-unit-size-mismatch.wav");
+        let (temp, mut file) = TempDownload::create(path).unwrap();
+        file.write_all(b"abc").unwrap();
+        drop(file);
 
-        let error = verify_file_size(path, 4).unwrap_err();
-        let _ = fs::remove_file(path);
+        let error = verify_file_size(temp.path(), 4).unwrap_err();
+        let temp_path = temp.path().to_path_buf();
         drop(temp);
 
         assert!(matches!(error, AppError::TransferVerification { .. }));
         assert!(!temp_path.exists());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn temp_file_leaves_an_existing_destination_untouched() {
+        let path = Path::new("target/tp7-unit-keep-existing.wav");
+        fs::create_dir_all("target").unwrap();
+        fs::write(path, b"original").unwrap();
+
+        let (temp, mut file) = TempDownload::create(path).unwrap();
+        file.write_all(b"short").unwrap();
+        drop(file);
+        let temp_path = temp.path().to_path_buf();
+        assert_ne!(temp_path, path);
+        drop(temp);
+
+        assert_eq!(fs::read(path).unwrap(), b"original");
+        assert!(!temp_path.exists());
+        let _ = fs::remove_file(path);
     }
 
     #[test]
     fn removes_the_temp_file_when_the_download_does_not_finish() {
-        let path = Path::new("target/tp7-unit-partial-download.tmp");
-        let temp = TempDownload::new(path).unwrap();
+        let path = Path::new("target/tp7-unit-partial-download.wav");
+        let (temp, file) = TempDownload::create(path).unwrap();
+        drop(file);
         let temp_path = temp.path().to_path_buf();
-        create_file(&temp_path).unwrap();
         assert!(temp_path.exists());
 
         drop(temp);

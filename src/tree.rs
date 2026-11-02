@@ -1,10 +1,14 @@
+use std::collections::HashSet;
+
 use mtp_rs::{ObjectHandle, ObjectInfo, Storage};
 use serde::{Deserialize, Serialize};
 
 use crate::mtp_session::{MtpOpenPolicy, block_on, open_mtp_session};
 use crate::output::AppError;
-use crate::remote::join_remote_path;
-use crate::remote::{RemoteObject, RemoteTarget, first_storage, list_object_infos, resolve_path};
+use crate::remote::{
+    RemoteObject, RemoteTarget, check_folder_descent, first_storage, join_remote_path,
+    list_object_infos, resolve_path,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeReport {
@@ -93,6 +97,10 @@ async fn collect_children(
         return Ok(());
     }
 
+    let mut visited = HashSet::new();
+    if let Some(parent) = parent {
+        visited.insert(parent);
+    }
     let mut stack = list_object_infos(storage, parent)
         .await?
         .into_iter()
@@ -109,6 +117,7 @@ async fn collect_children(
         entries.push(TreeEntry::from_object(path.clone(), current_depth, object));
 
         if should_descend {
+            check_folder_descent(&mut visited, child_parent, current_depth + 1, &path)?;
             let children = list_object_infos(storage, Some(child_parent)).await?;
             stack.extend(
                 children

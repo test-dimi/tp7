@@ -171,7 +171,7 @@ fn mode_check(device: &Tp7Device) -> DoctorCheck {
 }
 
 fn find_process_conflicts() -> Result<Vec<ProcessConflict>, AppError> {
-    let output = Command::new("ps")
+    let output = Command::new("/bin/ps")
         .args(["-axo", "pid=,comm=,args="])
         .output()
         .map_err(|error| AppError::ProcessInspection {

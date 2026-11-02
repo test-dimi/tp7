@@ -164,7 +164,10 @@ fn wait_for_power_on(
         return Err(powered_off());
     }
 
-    eprintln!("{}", powered_off());
+    eprintln!(
+        "{}",
+        crate::output::terminal_safe(&powered_off().to_string())
+    );
     eprintln!(
         "waiting up to {} s for the TP-7 to come back",
         POWER_ON_TIMEOUT.as_secs()
@@ -228,6 +231,12 @@ fn take_over_from_ptpcamerad() -> Result<bool, AppError> {
     }
 
     for pid in pids {
+        // The PID came from an IORegistry snapshot. Confirm it still belongs to
+        // ptpcamerad right before the kill, so a recycled PID is never hit.
+        if !process_is_ptpcamerad(pid)? {
+            log::warn!("process {pid} is no longer ptpcamerad; not terminating it");
+            continue;
+        }
         log::warn!("terminating ptpcamerad process {pid} to claim the TP-7 MTP interface");
         let status = Command::new("/bin/kill")
             .args(["-KILL", &pid.to_string()])
@@ -246,6 +255,28 @@ fn take_over_from_ptpcamerad() -> Result<bool, AppError> {
     Ok(true)
 }
 
+fn process_is_ptpcamerad(pid: u32) -> Result<bool, AppError> {
+    let output = Command::new("/bin/ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .map_err(|error| AppError::MtpTakeover {
+            message: format!("could not inspect process {pid}: {error}"),
+        })?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    Ok(is_ptpcamerad_command(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// `ps -o comm=` prints the executable path on macOS.
+fn is_ptpcamerad_command(comm: &str) -> bool {
+    comm.trim().rsplit('/').next() == Some("ptpcamerad")
+}
+
 pub async fn open_prepared_mtp_session(
     prepared: PreparedMtpDevice,
 ) -> Result<MtpSession, AppError> {
@@ -255,27 +286,51 @@ pub async fn open_prepared_mtp_session(
 }
 
 pub async fn open_mtp_device(serial: Option<&str>) -> Result<MtpDevice, AppError> {
+    // Only ever open a TP-7 in MTP mode. `open_first` would accept any MTP
+    // device (a phone, a camera), so pick the exact one from the list first.
+    let candidates = MtpDevice::list_devices_with_known(KNOWN_TP7)
+        .map_err(map_mtp_error)?
+        .into_iter()
+        .filter(|info| KNOWN_TP7.contains(&(info.vendor_id, info.product_id)))
+        .map(|info| (info.serial_number, info.location_id))
+        .collect::<Vec<_>>();
+    let location_id = select_mtp_location(&candidates, serial)?;
+
+    let builder = MtpDevice::builder()
+        .known_devices(KNOWN_TP7)
+        .reuse_existing_session(TP7_SESSION_ID);
     let device = match serial {
-        Some(serial) => {
-            MtpDevice::builder()
-                .known_devices(KNOWN_TP7)
-                .reuse_existing_session(TP7_SESSION_ID)
-                .open_by_serial(serial)
-                .await
-        }
-        None => {
-            MtpDevice::builder()
-                .known_devices(KNOWN_TP7)
-                .reuse_existing_session(TP7_SESSION_ID)
-                .open_first()
-                .await
-        }
+        Some(serial) => builder.open_by_serial(serial).await,
+        None => builder.open_by_location(location_id).await,
     }
     .map_err(map_mtp_error)?;
 
     initialize_tp7_session(&device).await?;
 
     Ok(device)
+}
+
+/// Picks the USB location of the one TP-7 to open from `(serial, location)`
+/// pairs of TP-7s in MTP mode, refusing when the choice is ambiguous.
+fn select_mtp_location(
+    candidates: &[(Option<String>, u64)],
+    serial: Option<&str>,
+) -> Result<u64, AppError> {
+    let matching = candidates
+        .iter()
+        .filter(|(candidate, _)| serial.is_none_or(|serial| candidate.as_deref() == Some(serial)))
+        .collect::<Vec<_>>();
+
+    match matching.as_slice() {
+        [(_, location_id)] => Ok(*location_id),
+        [] => match serial {
+            Some(serial) => Err(AppError::DeviceNotFound {
+                serial: serial.to_string(),
+            }),
+            None => Err(AppError::NoDevices),
+        },
+        many => Err(AppError::MultipleDevices { count: many.len() }),
+    }
 }
 
 async fn initialize_tp7_session(device: &MtpDevice) -> Result<(), AppError> {
@@ -416,6 +471,39 @@ mod tests {
             registry_entry_id: Some("0x00000001000b6528".to_string()),
             interfaces: vec![],
         }
+    }
+
+    #[test]
+    fn opens_only_an_unambiguous_tp7() {
+        let one = [(Some("F1RTL11C".to_string()), 7)];
+        assert_eq!(select_mtp_location(&one, None).unwrap(), 7);
+        assert_eq!(select_mtp_location(&one, Some("F1RTL11C")).unwrap(), 7);
+        assert!(matches!(
+            select_mtp_location(&one, Some("OTHER")),
+            Err(AppError::DeviceNotFound { .. })
+        ));
+        assert!(matches!(
+            select_mtp_location(&[], None),
+            Err(AppError::NoDevices)
+        ));
+
+        let two = [(None, 7), (None, 9)];
+        assert!(matches!(
+            select_mtp_location(&two, None),
+            Err(AppError::MultipleDevices { count: 2 })
+        ));
+    }
+
+    #[test]
+    fn recognizes_ptpcamerad_by_executable_name() {
+        assert!(is_ptpcamerad_command(
+            "/System/Library/Frameworks/ImageCaptureCore.framework/Versions/A/XPCServices/ptpcamerad\n"
+        ));
+        assert!(is_ptpcamerad_command("ptpcamerad"));
+        assert!(!is_ptpcamerad_command("/usr/bin/ptpcamerad-helper"));
+        assert!(!is_ptpcamerad_command(
+            "/Applications/Evil.app/ptpcamerad.sh"
+        ));
     }
 
     #[test]

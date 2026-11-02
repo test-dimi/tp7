@@ -16,7 +16,7 @@ mod tree;
 mod usb_owner;
 mod write_ops;
 
-pub use output::AppError;
+pub use output::{AppError, terminal_safe};
 
 use clap::Parser;
 use cli::{Cli, Command};

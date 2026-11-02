@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::Serialize;
 use thiserror::Error;
 
@@ -14,6 +16,42 @@ use crate::status::StatusReport;
 use crate::tree::TreeReport;
 use crate::usb_owner::UsbOwner;
 use crate::write_ops::{MkdirReport, RenameReport, RmReport};
+
+/// `println!` for human-readable output. File names, serials and other text
+/// that comes from the device are escaped so they can't drive the terminal.
+macro_rules! say {
+    ($($arg:tt)*) => {
+        println!("{}", terminal_safe(&format!($($arg)*)))
+    };
+}
+
+/// Escapes control characters (C0, DEL, C1) and Unicode bidi controls so
+/// device-supplied text prints literally instead of being interpreted by the
+/// terminal (escape sequences, title or clipboard changes, reordered text).
+/// Newlines are kept, because callers format multi-line output.
+pub fn terminal_safe(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(needs_escape) {
+        return Cow::Borrowed(text);
+    }
+
+    let mut escaped = String::with_capacity(text.len() + 8);
+    for character in text.chars() {
+        if needs_escape(character) {
+            escaped.extend(character.escape_unicode());
+        } else {
+            escaped.push(character);
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+fn needs_escape(character: char) -> bool {
+    (character.is_control() && character != '\n')
+        || matches!(
+            character,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct LsDisplayOptions {
@@ -196,12 +234,12 @@ pub fn write_devices(devices: &[Tp7Device], json: bool) -> Result<(), AppError> 
     }
 
     if devices.is_empty() {
-        println!("No TP-7 devices found.");
+        say!("No TP-7 devices found.");
         return Ok(());
     }
 
     for device in devices {
-        println!(
+        say!(
             "{}  {}  {}:{}  {}  {}",
             device.serial_number.as_deref().unwrap_or("<no-serial>"),
             device.mode,
@@ -210,22 +248,22 @@ pub fn write_devices(devices: &[Tp7Device], json: bool) -> Result<(), AppError> 
             device.speed.as_deref().unwrap_or("unknown-speed"),
             device.product.as_deref().unwrap_or("TP-7")
         );
-        println!("  manufacturer: {}", display_opt(&device.manufacturer));
-        println!("  usb version: {}", device.usb_version);
-        println!(
+        say!("  manufacturer: {}", display_opt(&device.manufacturer));
+        say!("  usb version: {}", device.usb_version);
+        say!(
             "  device version: {}",
             device.device_version.as_deref().unwrap_or("unknown")
         );
         if let Some(location_id) = &device.location_id {
-            println!("  macOS location id: {location_id}");
+            say!("  macOS location id: {location_id}");
         }
         if let Some(bus_id) = &device.bus_id {
-            println!("  bus: {bus_id}");
+            say!("  bus: {bus_id}");
         }
         if let Some(address) = device.device_address {
-            println!("  address: {address}");
+            say!("  address: {address}");
         }
-        println!("  interfaces: {}", interface_summary(&device.interfaces));
+        say!("  interfaces: {}", interface_summary(&device.interfaces));
     }
 
     Ok(())
@@ -237,24 +275,29 @@ pub fn write_status(report: &StatusReport, json: bool) -> Result<(), AppError> {
         return Ok(());
     }
 
-    println!(
+    say!(
         "{}  {}  {}",
         report.usb.serial_number.as_deref().unwrap_or("<no-serial>"),
         report.usb.mode,
         report.usb.product.as_deref().unwrap_or("TP-7")
     );
-    println!(
+    say!(
         "  mtp: {} {} ({})",
-        report.mtp.manufacturer, report.mtp.model, report.mtp.device_version
+        report.mtp.manufacturer,
+        report.mtp.model,
+        report.mtp.device_version
     );
-    println!("  mtp serial: {}", report.mtp.serial_number);
-    println!("  supports rename: {}", report.mtp.supports_rename);
-    println!("  storages: {}", report.mtp.storage_count);
+    say!("  mtp serial: {}", report.mtp.serial_number);
+    say!("  supports rename: {}", report.mtp.supports_rename);
+    say!("  storages: {}", report.mtp.storage_count);
 
     for storage in &report.mtp.storages {
-        println!(
+        say!(
             "  - {}: {} free of {} bytes ({})",
-            storage.id, storage.free_space_bytes, storage.max_capacity_bytes, storage.description
+            storage.id,
+            storage.free_space_bytes,
+            storage.max_capacity_bytes,
+            storage.description
         );
     }
 
@@ -267,20 +310,20 @@ pub fn write_connect(report: &ConnectReport, json: bool) -> Result<(), AppError>
         return Ok(());
     }
 
-    println!(
+    say!(
         "{}  {} -> {}  {}",
         report.serial_number.as_deref().unwrap_or("<no-serial>"),
         report.initial_mode,
         report.final_mode,
         report.message
     );
-    println!("  switched: {}", if report.switched { "yes" } else { "no" });
-    println!("  mtp session: {}", report.mtp_session.message);
+    say!("  switched: {}", if report.switched { "yes" } else { "no" });
+    say!("  mtp session: {}", report.mtp_session.message);
     if let Some(storage_count) = report.mtp_session.storage_count {
-        println!("  storages: {storage_count}");
+        say!("  storages: {storage_count}");
     }
     if let Some(midi_switch) = &report.midi_switch {
-        println!(
+        say!(
             "  midi switch: command 0x{:02x}, payload {}",
             midi_switch.command,
             midi_switch.payload.join(" ")
@@ -307,7 +350,7 @@ pub fn write_ls(report: &LsReport, json: bool, options: LsDisplayOptions) -> Res
         let size = ls_size_label(entry.size, options.human_readable);
 
         match (options.long, options.ids, options.size) {
-            (true, true, _) => println!(
+            (true, true, _) => say!(
                 "{:>10} {:<6} {:>12} {:<15} {}",
                 entry.id,
                 ls_kind_label(&entry.kind),
@@ -315,17 +358,17 @@ pub fn write_ls(report: &LsReport, json: bool, options: LsDisplayOptions) -> Res
                 entry.modified.as_deref().unwrap_or("-"),
                 name
             ),
-            (true, false, _) => println!(
+            (true, false, _) => say!(
                 "{:<6} {:>12} {:<15} {}",
                 ls_kind_label(&entry.kind),
                 size,
                 entry.modified.as_deref().unwrap_or("-"),
                 name
             ),
-            (false, true, true) => println!("{:>10} {size:>12} {name}", entry.id),
-            (false, true, false) => println!("{:>10} {name}", entry.id),
-            (false, false, true) => println!("{size:>12} {name}"),
-            (false, false, false) => println!("{name}"),
+            (false, true, true) => say!("{:>10} {size:>12} {name}", entry.id),
+            (false, true, false) => say!("{:>10} {name}", entry.id),
+            (false, false, true) => say!("{size:>12} {name}"),
+            (false, false, false) => say!("{name}"),
         }
     }
 
@@ -338,19 +381,19 @@ pub fn write_stat(report: &StatReport, json: bool) -> Result<(), AppError> {
         return Ok(());
     }
 
-    println!(
+    say!(
         "{}  {}  {}",
         report.path,
         ls_kind_label(&report.object.kind),
         report.object.name
     );
-    println!("  id: {}", report.object.id);
-    println!("  parent: {}", report.object.parent_id);
-    println!("  storage: {}", report.object.storage_id);
-    println!("  size: {}", size_with_bytes(report.object.size));
-    println!("  format: {} ({})", report.format, report.format_code);
-    println!("  created: {}", report.created.as_deref().unwrap_or("-"));
-    println!(
+    say!("  id: {}", report.object.id);
+    say!("  parent: {}", report.object.parent_id);
+    say!("  storage: {}", report.object.storage_id);
+    say!("  size: {}", size_with_bytes(report.object.size));
+    say!("  format: {} ({})", report.format, report.format_code);
+    say!("  created: {}", report.created.as_deref().unwrap_or("-"));
+    say!(
         "  modified: {}",
         report.object.modified.as_deref().unwrap_or("-")
     );
@@ -369,7 +412,7 @@ pub fn write_tree(report: &TreeReport, json: bool, ids: bool) -> Result<(), AppE
     let root_indent = if entry_is_requested_file {
         0
     } else {
-        println!("{}", report.path);
+        say!("{}", report.path);
         1
     };
 
@@ -378,9 +421,9 @@ pub fn write_tree(report: &TreeReport, json: bool, ids: bool) -> Result<(), AppE
         let name = ls_display_name(entry.object.name.as_str(), &entry.object.kind);
 
         if ids {
-            println!("{indent}{:>10} {name}", entry.object.id);
+            say!("{indent}{:>10} {name}", entry.object.id);
         } else {
-            println!("{indent}{name}");
+            say!("{indent}{name}");
         }
     }
 
@@ -395,7 +438,7 @@ pub fn write_pull(report: &PullReport, json: bool) -> Result<(), AppError> {
 
     for file in &report.files {
         let status = pull_status_label(&file.status);
-        println!(
+        say!(
             "{status} {} -> {} ({})",
             file.remote_path,
             file.local_path,
@@ -410,14 +453,14 @@ pub fn write_pull(report: &PullReport, json: bool) -> Result<(), AppError> {
             .filter(|file| file.status == PullStatus::DryRun)
             .map(|file| file.size)
             .sum();
-        println!(
+        say!(
             "{} downloaded, {} skipped, {} would download",
             report.downloaded,
             report.skipped,
             size_with_bytes(planned_bytes)
         );
     } else {
-        println!(
+        say!(
             "{} downloaded, {} skipped, {}",
             report.downloaded,
             report.skipped,
@@ -436,7 +479,7 @@ pub fn write_push(report: &PushReport, json: bool) -> Result<(), AppError> {
 
     for file in &report.files {
         let status = push_status_label(&file.status);
-        println!(
+        say!(
             "{status} {} -> {} ({})",
             file.local_path,
             file.remote_path,
@@ -446,13 +489,13 @@ pub fn write_push(report: &PushReport, json: bool) -> Result<(), AppError> {
 
     if report.dry_run {
         let planned_bytes = report.files.iter().map(|file| file.size).sum();
-        println!(
+        say!(
             "{} uploaded, {} would upload",
             report.uploaded,
             size_with_bytes(planned_bytes)
         );
     } else {
-        println!(
+        say!(
             "{} uploaded, {}",
             report.uploaded,
             size_with_bytes(report.total_bytes)
@@ -469,10 +512,10 @@ pub fn write_mkdir(report: &MkdirReport, json: bool) -> Result<(), AppError> {
     }
 
     if report.created.is_empty() {
-        println!("exists {}", report.path);
+        say!("exists {}", report.path);
     } else {
         for path in &report.created {
-            println!("created {path}");
+            say!("created {path}");
         }
     }
 
@@ -485,7 +528,7 @@ pub fn write_rename(report: &RenameReport, json: bool) -> Result<(), AppError> {
         return Ok(());
     }
 
-    println!("renamed {} -> {}", report.old_path, report.new_path);
+    say!("renamed {} -> {}", report.old_path, report.new_path);
 
     Ok(())
 }
@@ -497,17 +540,32 @@ pub fn write_rm(report: &RmReport, json: bool) -> Result<(), AppError> {
     }
 
     if report.removed.is_empty() {
-        println!("nothing removed");
+        say!("nothing removed");
         return Ok(());
     }
 
+    let status = if report.dry_run {
+        "would remove"
+    } else {
+        "removed"
+    };
     for object in &report.removed {
-        let status = if report.dry_run {
-            "would remove"
-        } else {
-            "removed"
-        };
-        println!("{status} {} ({})", report.path, ls_kind_label(&object.kind));
+        say!("{status} {} ({})", report.path, ls_kind_label(&object.kind));
+    }
+
+    if !report.contents.is_empty() {
+        let (files, bytes) = report.content_totals();
+        say!(
+            "{status} everything inside it: {files} files, {}",
+            size_with_bytes(bytes)
+        );
+        for entry in &report.contents {
+            say!(
+                "  {status} {} ({})",
+                entry.path,
+                ls_kind_label(&entry.object.kind)
+            );
+        }
     }
 
     Ok(())
@@ -519,15 +577,15 @@ pub fn write_eject(report: &EjectReport, json: bool) -> Result<(), AppError> {
         return Ok(());
     }
 
-    println!(
+    say!(
         "{}  {} -> {}  {}",
         report.serial_number.as_deref().unwrap_or("<no-serial>"),
         report.initial_mode,
         report.final_mode,
         report.message
     );
-    println!("  switched: {}", if report.switched { "yes" } else { "no" });
-    println!("  closed: {}", if report.closed { "yes" } else { "no" });
+    say!("  switched: {}", if report.switched { "yes" } else { "no" });
+    say!("  closed: {}", if report.closed { "yes" } else { "no" });
 
     Ok(())
 }
@@ -538,14 +596,14 @@ pub fn write_doctor(report: &DoctorReport, json: bool) -> Result<(), AppError> {
         return Ok(());
     }
 
-    println!("TP-7 doctor");
+    say!("TP-7 doctor");
     for check in &report.checks {
-        println!("[{}] {}: {}", check.status, check.name, check.message);
+        say!("[{}] {}: {}", check.status, check.name, check.message);
     }
 
     if !report.process_conflicts.is_empty() {
         println!();
-        println!("Possible process conflicts:");
+        say!("Possible process conflicts:");
         for conflict in &report.process_conflicts {
             print_process_conflict(conflict);
         }
@@ -553,7 +611,7 @@ pub fn write_doctor(report: &DoctorReport, json: bool) -> Result<(), AppError> {
 
     if !report.usb_owners.is_empty() {
         println!();
-        println!("macOS USB owners:");
+        say!("macOS USB owners:");
         for owner in &report.usb_owners {
             print_usb_owner(owner);
         }
@@ -561,9 +619,9 @@ pub fn write_doctor(report: &DoctorReport, json: bool) -> Result<(), AppError> {
 
     if !report.devices.is_empty() {
         println!();
-        println!("Detected devices:");
+        say!("Detected devices:");
         for device in &report.devices {
-            println!(
+            say!(
                 "- {} ({})",
                 device.serial_number.as_deref().unwrap_or("<no-serial>"),
                 device.mode
@@ -671,9 +729,11 @@ fn push_status_label(status: &PushStatus) -> &'static str {
 }
 
 fn print_process_conflict(conflict: &ProcessConflict) {
-    println!(
+    say!(
         "- pid {}: {} ({})",
-        conflict.pid, conflict.name, conflict.reason
+        conflict.pid,
+        conflict.name,
+        conflict.reason
     );
 }
 
@@ -695,15 +755,30 @@ fn print_usb_owner(owner: &UsbOwner) {
         None => format!("{} {}", owner.scope, owner.scope_node_name),
     };
 
-    println!(
+    say!(
         "- {} pid {}: {} on {}",
-        owner.kind, pid, owner.process, location
+        owner.kind,
+        pid,
+        owner.process,
+        location
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escapes_terminal_control_sequences_from_the_device() {
+        assert_eq!(terminal_safe("take 1.wav"), "take 1.wav");
+        assert_eq!(terminal_safe("a\nb"), "a\nb");
+        assert_eq!(
+            terminal_safe("evil\u{1b}]0;pwned\u{7}.wav"),
+            "evil\\u{1b}]0;pwned\\u{7}.wav"
+        );
+        assert_eq!(terminal_safe("\u{9b}2J"), "\\u{9b}2J");
+        assert_eq!(terminal_safe("abc\u{202e}vaw.exe"), "abc\\u{202e}vaw.exe");
+    }
 
     #[test]
     fn powered_off_error_explains_the_bootloader_personality() {

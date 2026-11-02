@@ -57,7 +57,7 @@ pub struct UsbOwner {
 
 #[cfg(target_os = "macos")]
 pub fn inspect_tp7_usb_owners() -> Result<Vec<UsbOwner>, AppError> {
-    let output = std::process::Command::new("ioreg")
+    let output = std::process::Command::new("/usr/sbin/ioreg")
         .args(["-r", "-c", "IOUSBHostDevice", "-d", "3", "-l", "-w", "0"])
         .output()
         .map_err(|error| AppError::UsbOwnershipInspection {
@@ -108,10 +108,15 @@ pub fn ptpcamerad_exclusive_owner_pids(owners: &[UsbOwner]) -> Vec<u32> {
 fn parse_ioreg_usb_owners(output: &str) -> Vec<UsbOwner> {
     let entries = parse_ioreg_entries(output);
     let mut owners = Vec::new();
-    let has_tp7_device = entries.iter().any(is_tp7_device_entry);
+
+    // Without a TP-7 in the registry, every owner belongs to some other USB
+    // device. Report none, so nothing (including `--take-over`) acts on them.
+    if !entries.iter().any(is_tp7_device_entry) {
+        return owners;
+    }
 
     for (index, entry) in entries.iter().enumerate() {
-        if has_tp7_device && !owner_belongs_to_tp7_device(&entries, index) {
+        if !owner_belongs_to_tp7_device(&entries, index) {
             continue;
         }
 
@@ -467,6 +472,28 @@ mod tests {
         assert_eq!(owners.len(), 1);
         assert_eq!(owners[0].pid, Some(1490));
         assert_eq!(owners[0].process, "MIDIServer");
+    }
+
+    #[test]
+    fn ignores_owners_when_no_tp7_is_present() {
+        let output = r#"
++-o Other Camera@01200000  <class IOUSBHostDevice, id 0x1000b7000, registered>
+  | {
+  |   "idVendor" = 1356
+  |   "idProduct" = 2508
+  | }
+  |
+  +-o PTP Intf@0  <class IOUSBHostInterface, id 0x1000b7010, registered>
+  | | {
+  | |   "UsbExclusiveOwner" = "pid 28379, ptpcamerad"
+  | |   "bInterfaceNumber" = 0
+  | | }
+"#;
+
+        let owners = parse_ioreg_usb_owners(output);
+
+        assert!(owners.is_empty());
+        assert!(ptpcamerad_exclusive_owner_pids(&owners).is_empty());
     }
 
     #[test]

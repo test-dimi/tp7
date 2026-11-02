@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use mtp_rs::{DateTime, MtpDevice, ObjectHandle, ObjectInfo, Storage};
 use serde::{Deserialize, Serialize};
 
@@ -188,6 +190,37 @@ pub fn join_remote_path(parent_path: &str, name: &str) -> String {
     }
 }
 
+/// Deepest folder nesting a recursive walk follows. Real TP-7 trees are a
+/// couple of levels deep; this only stops a device that reports a cycle or an
+/// endless chain from looping or exhausting memory.
+pub const MAX_FOLDER_DEPTH: usize = 64;
+
+/// Records that a recursive walk is about to enter `handle` at `depth`, and
+/// refuses when the folder was already visited (a cycle) or the walk is too
+/// deep.
+pub fn check_folder_descent(
+    visited: &mut HashSet<ObjectHandle>,
+    handle: ObjectHandle,
+    depth: usize,
+    path: &str,
+) -> Result<(), AppError> {
+    if depth > MAX_FOLDER_DEPTH {
+        return Err(AppError::Mtp {
+            message: format!(
+                "TP-7 folder tree is deeper than {MAX_FOLDER_DEPTH} levels at {path}; stopping"
+            ),
+        });
+    }
+
+    if !visited.insert(handle) {
+        return Err(AppError::Mtp {
+            message: format!("TP-7 reported a folder loop at {path}; stopping"),
+        });
+    }
+
+    Ok(())
+}
+
 pub fn sort_remote_objects(objects: &mut [RemoteObject]) {
     objects.sort_by(|left, right| {
         let left_kind = kind_sort_key(&left.kind);
@@ -220,6 +253,35 @@ fn kind_sort_key(kind: &ObjectKind) -> u8 {
     match kind {
         ObjectKind::Folder => 0,
         ObjectKind::File => 1,
+    }
+}
+
+#[cfg(test)]
+mod descent_tests {
+    use super::*;
+
+    #[test]
+    fn refuses_a_folder_seen_twice() {
+        let mut visited = HashSet::new();
+
+        assert!(check_folder_descent(&mut visited, ObjectHandle(7), 1, "/a").is_ok());
+        assert!(matches!(
+            check_folder_descent(&mut visited, ObjectHandle(7), 2, "/a/a"),
+            Err(AppError::Mtp { .. })
+        ));
+    }
+
+    #[test]
+    fn refuses_walks_past_the_depth_cap() {
+        let mut visited = HashSet::new();
+
+        assert!(
+            check_folder_descent(&mut visited, ObjectHandle(1), MAX_FOLDER_DEPTH, "/x").is_ok()
+        );
+        assert!(
+            check_folder_descent(&mut visited, ObjectHandle(2), MAX_FOLDER_DEPTH + 1, "/x/y")
+                .is_err()
+        );
     }
 }
 
