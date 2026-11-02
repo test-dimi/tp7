@@ -367,6 +367,23 @@ fn safe_child_path(parent: &Path, name: &str) -> Result<PathBuf, AppError> {
 /// How many differently named temp files to try before giving up.
 const TEMP_CREATE_ATTEMPTS: u32 = 16;
 
+/// Longest slice of the destination name kept in a temp name. The suffix
+/// adds about 40 bytes, and macOS file names stop at 255 bytes.
+const TEMP_NAME_STEM_BYTES: usize = 160;
+
+/// The longest prefix of `text` that fits in `max_bytes` without splitting a
+/// character.
+fn clip_to_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn temp_download_path(local_path: &Path, attempt: u32) -> Result<PathBuf, AppError> {
     let Some(file_name) = local_path.file_name() else {
         return Err(AppError::InvalidArguments {
@@ -379,7 +396,7 @@ fn temp_download_path(local_path: &Path, attempt: u32) -> Result<PathBuf, AppErr
         .unwrap_or_default();
     let temp_name = format!(
         ".{}.{}-{stamp}-{attempt}.tp7tmp",
-        file_name.to_string_lossy(),
+        clip_to_bytes(&file_name.to_string_lossy(), TEMP_NAME_STEM_BYTES),
         std::process::id()
     );
 
@@ -579,6 +596,19 @@ mod tests {
         assert!(name.starts_with(".take.wav."));
         assert!(name.ends_with(".tp7tmp"));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn keeps_temp_names_under_the_file_name_limit() {
+        let long_name = format!("{}.wav", "é".repeat(120));
+        let temp = temp_download_path(&Path::new("out").join(&long_name), 15).unwrap();
+        let name = temp.file_name().unwrap().to_string_lossy().to_string();
+
+        assert!(long_name.len() > 240);
+        assert!(name.len() <= 255, "{} bytes", name.len());
+        assert!(name.ends_with(".tp7tmp"));
+        assert_eq!(clip_to_bytes("aé", 2), "a");
+        assert_eq!(clip_to_bytes("short", 160), "short");
     }
 
     #[test]

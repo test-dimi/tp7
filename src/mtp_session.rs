@@ -226,10 +226,7 @@ fn take_over_from_ptpcamerad() -> Result<bool, AppError> {
     let owners = inspect_tp7_usb_owners()?;
     let pids = ptpcamerad_exclusive_owner_pids(&owners);
 
-    if pids.is_empty() {
-        return Ok(false);
-    }
-
+    let mut terminated = false;
     for pid in pids {
         // The PID came from an IORegistry snapshot. Confirm it still belongs to
         // ptpcamerad right before the kill, so a recycled PID is never hit.
@@ -250,9 +247,11 @@ fn take_over_from_ptpcamerad() -> Result<bool, AppError> {
                 message: format!("could not terminate ptpcamerad process {pid}: {status}"),
             });
         }
+        terminated = true;
     }
 
-    Ok(true)
+    // Only worth retrying the open when something was actually stopped.
+    Ok(terminated)
 }
 
 fn process_is_ptpcamerad(pid: u32) -> Result<bool, AppError> {
