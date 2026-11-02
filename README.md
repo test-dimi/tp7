@@ -24,9 +24,11 @@ tp7 -a push ./clip.wav /memo/clip.wav --overwrite
 tp7 -a rm /memo/clip.wav --dry-run
 ```
 
-For normal use, prefer `-a` / `--auto-connect`. Each command then handles the full TP-7 lifecycle: detect the recorder, switch to MTP if needed, open MTP, do the operation, and close cleanly.
+For normal use, prefer `-a` / `--auto-connect`. Each command detects the
+recorder, switches to MTP if needed, opens or reuses the MTP session, performs
+the operation, and leaves the recorder ready for the next command.
 
-`tp7 connect` and `tp7 eject` are diagnostic/manual-control commands. They are useful for checking whether MTP can be opened and released, but they are not a "mount once, run many commands, eject later" workflow.
+`tp7 connect` is a diagnostic command for checking whether MTP can be opened. `tp7 eject` closes the device-side MTP session, which sends the TP-7 back to its normal audio/MIDI mode; run it when you are done transferring files.
 
 ## Command surface
 
@@ -63,6 +65,20 @@ tp7 -a ls -lah /memo
 tp7 -a ls -sS --human-readable /
 tp7 -a ls -ltr /recordings
 ```
+
+TP-7 file commands leave the recorder in MTP mode after they exit, so repeated
+commands work without reconnecting or a resident helper process. `tp7 eject`
+is the explicit way to close the device-side MTP session. On macOS,
+`ptpcamerad` may claim the interface before `tp7`; when that happens,
+`--take-over` can reclaim it and retry:
+
+```sh
+tp7 -a ls --take-over -lah /
+```
+
+`--take-over` only terminates a process when macOS reports `ptpcamerad` as the
+exclusive owner of the TP-7 MTP interface. It does not terminate FieldKit,
+OpenMTP, or unrecognized owners.
 
 ## Agent-friendly by design
 

@@ -6,14 +6,15 @@ use crate::output::AppError;
 pub const TP7_VENDOR_ID: u16 = 0x2367;
 /// MTP personality on every firmware seen so far, and also the audio/MIDI
 /// personality on firmware `1.1.9`.
-pub const TP7_PRODUCT_ID: u16 = 0x0019;
-/// Audio/MIDI personality on firmware `2.5.7`, which moved it off
-/// `TP7_PRODUCT_ID` and left that id for MTP mode only.
+pub const TP7_MTP_PRODUCT_ID: u16 = 0x0019;
+/// Audio/MIDI personality on newer firmware (OS 1.1.11, which reports itself
+/// as `2.5.7` over USB/MTP). It moved off `0x0019`, leaving that id for MTP
+/// mode only.
 pub const TP7_AUDIO_MIDI_PRODUCT_ID: u16 = 0x8019;
 
 /// Reports whether a USB product id is a TP-7 in either personality.
 pub fn is_tp7_product_id(product_id: u16) -> bool {
-    matches!(product_id, TP7_PRODUCT_ID | TP7_AUDIO_MIDI_PRODUCT_ID)
+    matches!(product_id, TP7_MTP_PRODUCT_ID | TP7_AUDIO_MIDI_PRODUCT_ID)
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -340,9 +341,9 @@ mod tests {
     fn tp7_device(serial_number: Option<&str>) -> Tp7Device {
         Tp7Device {
             vendor_id: TP7_VENDOR_ID,
-            product_id: TP7_PRODUCT_ID,
+            product_id: TP7_AUDIO_MIDI_PRODUCT_ID,
             vendor_id_hex: "0x2367".to_string(),
-            product_id_hex: "0x0019".to_string(),
+            product_id_hex: "0x8019".to_string(),
             manufacturer: Some("teenage engineering".to_string()),
             product: Some("TP-7".to_string()),
             serial_number: serial_number.map(str::to_string),
@@ -364,7 +365,7 @@ mod tests {
 
     #[test]
     fn recognizes_known_product_ids() {
-        assert!(is_tp7_product_id(TP7_PRODUCT_ID));
+        assert!(is_tp7_product_id(TP7_MTP_PRODUCT_ID));
         assert!(is_tp7_product_id(TP7_AUDIO_MIDI_PRODUCT_ID));
         assert!(!is_tp7_product_id(0x0018));
         assert!(!is_tp7_product_id(0x8018));
@@ -376,6 +377,13 @@ mod tests {
         let interfaces = vec![interface(0x01, 0x01, 0), interface(0x01, 0x03, 0)];
 
         assert_eq!(infer_usb_mode(&interfaces), UsbMode::AudioMidi);
+    }
+
+    #[test]
+    fn recognizes_audio_midi_and_mtp_product_ids() {
+        assert!(is_tp7_product_id(TP7_AUDIO_MIDI_PRODUCT_ID));
+        assert!(is_tp7_product_id(TP7_MTP_PRODUCT_ID));
+        assert!(!is_tp7_product_id(0x1234));
     }
 
     #[test]
