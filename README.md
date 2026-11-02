@@ -111,7 +111,15 @@ Skipped files stay visible. Human output prints one line per file, labelled `ski
 }
 ```
 
-Downloads use temporary files and verify the final local size. Upload overwrite uses a staged remote replacement: the new file is uploaded under a temporary name before the existing object is renamed out of the way.
+Downloads stream into a uniquely named hidden `.tp7tmp` file next to the destination, and its size is checked before it replaces anything, so a short transfer never costs you an existing local copy. A failed upload deletes the partial file it left on the TP-7. Upload overwrite uses a staged remote replacement: the new file is uploaded under a temporary name before the existing object is renamed out of the way.
+
+`rm --recursive` deletes a folder and everything inside it in one MTP call. The report, and `--dry-run`, list every file inside the folder with the total size, so preview before deleting:
+
+```sh
+tp7 -a rm /recordings/old --recursive --dry-run
+```
+
+Human-readable output escapes control and bidi characters in names that come from the device; `--json` output is unchanged.
 
 ## Current TP-7 limitations
 

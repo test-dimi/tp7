@@ -366,7 +366,9 @@ Delete a file or directory.
 
 Useful flags:
 
-- `--recursive`
+- `--recursive`: required for folders. The TP-7 deletes the folder and its
+  contents in one call, so the report (and `--dry-run`) lists every object
+  inside it, with the file count and total size.
 - `--force`
 - `--dry-run`
 
