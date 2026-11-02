@@ -295,14 +295,14 @@ pub async fn open_mtp_device(serial: Option<&str>) -> Result<MtpDevice, AppError
         .collect::<Vec<_>>();
     let location_id = select_mtp_location(&candidates, serial)?;
 
-    let builder = MtpDevice::builder()
+    // Open the exact USB location picked above. `open_by_serial` would list
+    // again and match on serial alone, without the TP-7 vendor/product check.
+    let device = MtpDevice::builder()
         .known_devices(KNOWN_TP7)
-        .reuse_existing_session(TP7_SESSION_ID);
-    let device = match serial {
-        Some(serial) => builder.open_by_serial(serial).await,
-        None => builder.open_by_location(location_id).await,
-    }
-    .map_err(map_mtp_error)?;
+        .reuse_existing_session(TP7_SESSION_ID)
+        .open_by_location(location_id)
+        .await
+        .map_err(map_mtp_error)?;
 
     initialize_tp7_session(&device).await?;
 

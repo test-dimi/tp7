@@ -234,7 +234,20 @@ async fn write_rm(
     }
 
     let contents = if object.is_folder() {
-        collect_folder_contents(&storage, object.handle, &resolved.path).await?
+        match collect_folder_contents(&storage, object.handle, &resolved.path).await {
+            Ok(contents) => contents,
+            // A dry run exists to show the contents, so it fails loudly. A real
+            // delete is one MTP call that doesn't need the listing; warn and go on.
+            Err(error) if !dry_run => {
+                eprintln!(
+                    "warning: could not list everything inside {} before deleting it: {}",
+                    crate::output::terminal_safe(&resolved.path),
+                    crate::output::terminal_safe(&error.to_string())
+                );
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         Vec::new()
     };

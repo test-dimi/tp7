@@ -100,8 +100,10 @@ async fn write_push(
     options: PushOptions,
 ) -> Result<PushReport, AppError> {
     let storage = first_storage(device).await?;
+    let rename_supported = device.supports_rename();
     if local_metadata(local_path)?.is_dir() {
-        return write_push_directory(&storage, local_path, remote_path, options).await;
+        return write_push_directory(&storage, local_path, remote_path, options, rename_supported)
+            .await;
     }
 
     let destination = resolve_file_destination(&storage, local_path, remote_path).await?;
@@ -127,7 +129,15 @@ async fn write_push(
         return Ok(report);
     }
 
-    put_file(&storage, local_path, &destination, size, options).await?;
+    put_file(
+        &storage,
+        local_path,
+        &destination,
+        size,
+        options,
+        rename_supported,
+    )
+    .await?;
 
     report.uploaded = 1;
     report.total_bytes = size;
@@ -145,6 +155,7 @@ async fn write_push_directory(
     local_path: &Path,
     remote_path: &str,
     options: PushOptions,
+    rename_supported: bool,
 ) -> Result<PushReport, AppError> {
     if !options.recursive {
         return Err(AppError::LocalPathIsFolder {
@@ -185,6 +196,7 @@ async fn write_push_directory(
                 &item.destination,
                 item.size,
                 options,
+                rename_supported,
             )
             .await?;
             report.uploaded += 1;
@@ -273,11 +285,25 @@ async fn put_file(
     destination: &RemoteDestination,
     size: u64,
     options: PushOptions,
+    rename_supported: bool,
 ) -> Result<(), AppError> {
     if let Some(existing) = &destination.existing {
         upload_replacement_file(storage, local_path, destination, existing, size, options).await?;
-    } else {
+    } else if rename_supported {
         upload_new_file(storage, local_path, destination, size, options).await?;
+    } else {
+        // Without rename there is no way to move a finished temp file into
+        // place, so upload under the real name; a failure still removes the
+        // partial file.
+        upload_file(
+            storage,
+            local_path,
+            destination,
+            &destination.name,
+            size,
+            options,
+        )
+        .await?;
     }
 
     Ok(())
@@ -293,8 +319,16 @@ async fn upload_new_file(
     size: u64,
     options: PushOptions,
 ) -> Result<(), AppError> {
-    let temporary = unique_temp_destination(storage, destination, "upload").await?;
-    let handle = upload_file(storage, local_path, &temporary, size, options).await?;
+    let temporary = fresh_temp_destination(destination, "upload");
+    let handle = upload_file(
+        storage,
+        local_path,
+        &temporary,
+        &destination.name,
+        size,
+        options,
+    )
+    .await?;
 
     if let Err(error) = storage
         .rename(handle, &destination.name)
@@ -316,8 +350,16 @@ async fn upload_replacement_file(
     size: u64,
     options: PushOptions,
 ) -> Result<(), AppError> {
-    let temporary = unique_temp_destination(storage, destination, "upload").await?;
-    let temporary_handle = upload_file(storage, local_path, &temporary, size, options).await?;
+    let temporary = fresh_temp_destination(destination, "upload");
+    let temporary_handle = upload_file(
+        storage,
+        local_path,
+        &temporary,
+        &destination.name,
+        size,
+        options,
+    )
+    .await?;
     let backup = unique_temp_destination(storage, destination, "backup").await?;
 
     if let Err(error) = storage
@@ -358,15 +400,19 @@ async fn upload_replacement_file(
     Ok(())
 }
 
+/// Uploads `local_path` as `destination`. The MTP object format (WAV, MP3,
+/// ...) comes from `final_name`, the name the file ends up with, so a file
+/// staged under a `.tmp` name still arrives typed as audio.
 async fn upload_file(
     storage: &Storage,
     local_path: &Path,
     destination: &RemoteDestination,
+    final_name: &str,
     size: u64,
     options: PushOptions,
 ) -> Result<ObjectHandle, AppError> {
     let stream = FileChunkStream::open(local_path)?;
-    let info = NewObjectInfo::file(destination.name.clone(), size);
+    let info = staged_object_info(&destination.name, final_name, size);
     let result = storage
         .upload_with_progress(destination.parent, info, stream, |progress| {
             write_progress(
@@ -581,6 +627,30 @@ fn validate_destination_for_write(
     Ok(())
 }
 
+/// Object info for a file uploaded as `upload_name` that will be renamed to
+/// `final_name`: the format is chosen from the final name's extension.
+fn staged_object_info(upload_name: &str, final_name: &str, size: u64) -> NewObjectInfo {
+    let mut info = NewObjectInfo::file(final_name, size);
+    info.filename = upload_name.to_string();
+    info
+}
+
+/// A temporary destination next to `destination` that needs no folder
+/// listing: the name carries the process id, a millisecond stamp and the
+/// label, so it can't collide with a user's file in practice, and it only
+/// exists until the finished upload is renamed.
+fn fresh_temp_destination(destination: &RemoteDestination, label: &str) -> RemoteDestination {
+    let parent_path = parent_remote_path(&destination.path);
+    let name = replacement_temp_name(&destination.name, label, 0);
+
+    RemoteDestination {
+        parent: destination.parent,
+        path: join_remote_path(&parent_path, &name),
+        name,
+        existing: None,
+    }
+}
+
 async fn unique_temp_destination(
     storage: &Storage,
     destination: &RemoteDestination,
@@ -619,12 +689,26 @@ async fn find_child(
         .find(|object| object.filename == name))
 }
 
+/// MTP names stop at 254 UTF-16 units and the temp suffix needs about 50,
+/// so the kept part of the original name is clipped to this many units.
+const TEMP_NAME_STEM_UTF16_UNITS: usize = 190;
+
+fn clip_to_utf16_units(text: &str, max_units: usize) -> String {
+    let mut units = 0;
+    text.chars()
+        .take_while(|character| {
+            units += character.len_utf16();
+            units <= max_units
+        })
+        .collect()
+}
+
 fn replacement_temp_name(final_name: &str, label: &str, attempt: u32) -> String {
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    let clipped_name = final_name.chars().take(120).collect::<String>();
+    let clipped_name = clip_to_utf16_units(final_name, TEMP_NAME_STEM_UTF16_UNITS);
 
     format!(
         "{clipped_name}.tp7cli-{label}-{}-{stamp}-{attempt}.tmp",
@@ -775,5 +859,28 @@ mod tests {
 
         assert!(name.starts_with("recording.wav.tp7cli-upload-"));
         assert!(name.ends_with("-3.tmp"));
+    }
+
+    #[test]
+    fn staged_uploads_keep_the_final_names_format() {
+        let staged = staged_object_info("take.wav.tp7cli-upload-1-2-0.tmp", "take.wav", 42);
+        let direct = NewObjectInfo::file("take.wav", 42);
+
+        assert_eq!(staged.filename, "take.wav.tp7cli-upload-1-2-0.tmp");
+        assert_eq!(staged.format, direct.format);
+        assert_ne!(
+            staged.format,
+            NewObjectInfo::file("take.wav.tp7cli-upload-1-2-0.tmp", 42).format
+        );
+    }
+
+    #[test]
+    fn keeps_temp_names_inside_the_mtp_name_limit() {
+        let long_name = format!("{}.wav", "\u{1f3b5}".repeat(150));
+        let name = replacement_temp_name(&long_name, "upload", 31);
+
+        assert!(name.encode_utf16().count() <= 254);
+        assert!(name.ends_with("-31.tmp"));
+        assert_eq!(clip_to_utf16_units("a\u{1f3b5}", 2), "a");
     }
 }

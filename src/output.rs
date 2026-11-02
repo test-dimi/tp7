@@ -28,7 +28,8 @@ macro_rules! say {
 /// Escapes control characters (C0, DEL, C1) and Unicode bidi controls so
 /// device-supplied text prints literally instead of being interpreted by the
 /// terminal (escape sequences, title or clipboard changes, reordered text).
-/// Newlines are kept, because callers format multi-line output.
+/// Newlines and Unicode line separators are escaped too, so a file name can't
+/// fake an extra line of output; every `say!` call prints one line.
 pub fn terminal_safe(text: &str) -> Cow<'_, str> {
     if !text.chars().any(needs_escape) {
         return Cow::Borrowed(text);
@@ -46,10 +47,10 @@ pub fn terminal_safe(text: &str) -> Cow<'_, str> {
 }
 
 fn needs_escape(character: char) -> bool {
-    (character.is_control() && character != '\n')
+    character.is_control()
         || matches!(
             character,
-            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
         )
 }
 
@@ -555,8 +556,9 @@ pub fn write_rm(report: &RmReport, json: bool) -> Result<(), AppError> {
 
     if !report.contents.is_empty() {
         let (files, bytes) = report.content_totals();
+        let noun = if files == 1 { "file" } else { "files" };
         say!(
-            "{status} everything inside it: {files} files, {}",
+            "{status} everything inside it: {files} {noun}, {}",
             size_with_bytes(bytes)
         );
         for entry in &report.contents {
@@ -771,7 +773,11 @@ mod tests {
     #[test]
     fn escapes_terminal_control_sequences_from_the_device() {
         assert_eq!(terminal_safe("take 1.wav"), "take 1.wav");
-        assert_eq!(terminal_safe("a\nb"), "a\nb");
+        assert_eq!(
+            terminal_safe("a.wav\nremoved /recordings (folder)"),
+            "a.wav\\u{a}removed /recordings (folder)"
+        );
+        assert_eq!(terminal_safe("a\u{2028}b"), "a\\u{2028}b");
         assert_eq!(
             terminal_safe("evil\u{1b}]0;pwned\u{7}.wav"),
             "evil\\u{1b}]0;pwned\\u{7}.wav"

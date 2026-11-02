@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mtp_rs::{ByteRange, DEFAULT_CANCEL_TIMEOUT, ObjectHandle, ObjectInfo, Storage};
 use serde::{Deserialize, Serialize};
@@ -224,6 +224,7 @@ async fn pull_file(
             Ok(())
         }
         PullStatus::Downloaded => {
+            remove_stale_temp_files(local_path);
             let (temp, file) = TempDownload::create(local_path)?;
             download_to_file(
                 storage,
@@ -234,10 +235,7 @@ async fn pull_file(
                 options,
             )
             .await?;
-            // Check the finished download before it replaces anything, so a short
-            // transfer can never cost the user an existing local copy.
-            verify_file_size(temp.path(), object.size)?;
-            rename_file(temp.path(), local_path)?;
+            finish_download(temp.path(), local_path, object.size)?;
 
             report.downloaded += 1;
             report.total_bytes += object.size;
@@ -528,6 +526,85 @@ fn create_dir_all(path: &Path) -> Result<(), AppError> {
     fs::create_dir_all(path).map_err(|error| io_error(path, error))
 }
 
+/// Moves a finished download into place, but only after its size matches
+/// what the TP-7 reported, so a short transfer can never cost the user an
+/// existing local copy. Errors name the destination, not the hidden temp file.
+fn finish_download(
+    temp_path: &Path,
+    local_path: &Path,
+    expected_size: u64,
+) -> Result<(), AppError> {
+    verify_file_size(temp_path, expected_size).map_err(|error| match error {
+        AppError::TransferVerification {
+            expected_size,
+            actual_size,
+            ..
+        } => AppError::TransferVerification {
+            path: path_to_string(local_path),
+            expected_size,
+            actual_size,
+        },
+        other => other,
+    })?;
+    rename_file(temp_path, local_path)
+}
+
+/// Temp files older than this are leftovers from an interrupted run.
+const STALE_TEMP_AGE: Duration = Duration::from_secs(15 * 60);
+
+/// Deletes hidden temp files that an interrupted pull (Ctrl-C skips the
+/// cleanup) left for the same destination, so they don't pile up. Only files
+/// in tp7's own naming pattern and older than `STALE_TEMP_AGE` are touched;
+/// failures are ignored because this is housekeeping.
+fn remove_stale_temp_files(local_path: &Path) {
+    let Some(file_name) = local_path.file_name() else {
+        return;
+    };
+    let prefix = format!(
+        ".{}.",
+        clip_to_bytes(&file_name.to_string_lossy(), TEMP_NAME_STEM_BYTES)
+    );
+    let parent = match local_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !is_stale_temp_name(&name, &prefix) {
+            continue;
+        }
+        let is_old = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > STALE_TEMP_AGE);
+        let is_file = entry.file_type().is_ok_and(|kind| kind.is_file());
+        if is_old && is_file {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Matches `{prefix}{pid}-{stamp}-{attempt}.tp7tmp` exactly.
+fn is_stale_temp_name(name: &str, prefix: &str) -> bool {
+    let Some(middle) = name
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(".tp7tmp"))
+    else {
+        return false;
+    };
+    let parts = middle.split('-').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn rename_file(from: &Path, to: &Path) -> Result<(), AppError> {
     fs::rename(from, to).map_err(|error| io_error(to, error))
 }
@@ -588,14 +665,13 @@ mod tests {
 
     #[test]
     fn builds_unique_hidden_temp_path_next_to_destination() {
-        let first = temp_download_path(Path::new("out/take.wav"), 0).unwrap();
-        let second = temp_download_path(Path::new("out/take.wav"), 1).unwrap();
-        let name = first.file_name().unwrap().to_string_lossy().to_string();
+        let path = temp_download_path(Path::new("out/take.wav"), 3).unwrap();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
 
-        assert_eq!(first.parent(), Some(Path::new("out")));
-        assert!(name.starts_with(".take.wav."));
-        assert!(name.ends_with(".tp7tmp"));
-        assert_ne!(first, second);
+        assert_eq!(path.parent(), Some(Path::new("out")));
+        assert!(name.starts_with(&format!(".take.wav.{}-", std::process::id())));
+        assert!(name.ends_with("-3.tp7tmp"));
+        assert!(is_stale_temp_name(&name, ".take.wav."));
     }
 
     #[test]
@@ -716,6 +792,54 @@ mod tests {
         assert!(matches!(error, AppError::TransferVerification { .. }));
         assert!(!temp_path.exists());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn short_download_never_replaces_an_existing_file() {
+        let path = Path::new("target/tp7-unit-finish-short.wav");
+        fs::create_dir_all("target").unwrap();
+        fs::write(path, b"original").unwrap();
+        let (temp, mut file) = TempDownload::create(path).unwrap();
+        file.write_all(b"short").unwrap();
+        drop(file);
+
+        let error = finish_download(temp.path(), path, 100).unwrap_err();
+
+        assert!(matches!(
+            &error,
+            AppError::TransferVerification { path: reported, .. } if *reported == path_to_string(path)
+        ));
+        assert_eq!(fs::read(path).unwrap(), b"original");
+        drop(temp);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn complete_download_replaces_the_destination() {
+        let path = Path::new("target/tp7-unit-finish-complete.wav");
+        fs::create_dir_all("target").unwrap();
+        fs::write(path, b"old").unwrap();
+        let (temp, mut file) = TempDownload::create(path).unwrap();
+        file.write_all(b"new data").unwrap();
+        drop(file);
+
+        finish_download(temp.path(), path, 8).unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), b"new data");
+        assert!(!temp.path().exists());
+        drop(temp);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn recognizes_only_tp7_temp_names() {
+        let prefix = ".take.wav.";
+
+        assert!(is_stale_temp_name(".take.wav.123-456-0.tp7tmp", prefix));
+        assert!(!is_stale_temp_name(".take.wav.tp7tmp", prefix));
+        assert!(!is_stale_temp_name(".take.wav.notes-456-0.tp7tmp", prefix));
+        assert!(!is_stale_temp_name(".take.wav.1-2.tp7tmp", prefix));
+        assert!(!is_stale_temp_name(".other.wav.123-456-0.tp7tmp", prefix));
     }
 
     #[test]

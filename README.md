@@ -121,6 +121,10 @@ tp7 -a rm /recordings/old --recursive --dry-run
 
 Human-readable output escapes control and bidi characters in names that come from the device; `--json` output is unchanged.
 
+Interrupted transfers: Ctrl-C skips tp7's cleanup. A pull can leave a hidden `.<name>.<numbers>.tp7tmp` file next to the target; the next pull of the same file removes such leftovers once they are 15 minutes old. A push can leave a `<name>.tp7cli-upload-….tmp` file on the TP-7; neither ever takes the real name, and you can delete it with `tp7 -a rm`. Each download is flushed to disk before it is renamed into place, which costs a little time per file in exchange for not losing a recording to a crash.
+
+With two TP-7s attached, `--auto-connect` refuses to send the MIDI mode switch, because the MIDI ports can't be matched to a serial number. Put the one you want into file mode yourself (hold STOP while powering on) or unplug the other; `--device <SERIAL>` then picks it.
+
 ## Current TP-7 limitations
 
 The TP-7 firmware tested here (`1.1.9`) accepts file upload, rename, delete, and download operations over MTP, but rejects MTP folder creation. Because of that:
