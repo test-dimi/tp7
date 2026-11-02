@@ -5,6 +5,9 @@ on:
     tags:
       - "v*"
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: 1.88.0
@@ -16,17 +19,18 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          override: true
           components: rustfmt, clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -36,7 +40,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Cache target directory
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target
           key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}
@@ -64,21 +68,21 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_VERSION }}
-          override: true
 
       - name: Add compilation targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -86,14 +90,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
-
-      - name: Cache target directory
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-target-${{ hashFiles('**/Cargo.lock') }}-macos
-          restore-keys: |
-            ${{ runner.os }}-target-
 
       - name: Build release binaries
         run: |
@@ -140,7 +136,7 @@ jobs:
           echo "archive_prefix=${BIN_NAME}-${VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ steps.package.outputs.archive_prefix }}
           path: |
@@ -154,12 +150,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-      pull-requests: write
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      arm_url: ${{ steps.metadata.outputs.arm_url }}
+      arm_sha: ${{ steps.metadata.outputs.arm_sha }}
+      intel_url: ${{ steps.metadata.outputs.intel_url }}
+      intel_sha: ${{ steps.metadata.outputs.intel_sha }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Determine version
         id: vars
@@ -172,7 +174,7 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
@@ -225,7 +227,7 @@ jobs:
           ./scripts/write-release-notes.sh release-notes.md "${VERSION}" "${ARM_URL}" "${ARM_SHA}" "${INTEL_URL}" "${INTEL_SHA}"
 
       - name: Publish GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           body_path: release-notes.md
           files: |
@@ -236,15 +238,29 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+    # Runs apart from the release job: this job holds the tap token and uses no
+    # third-party actions, and the release job never sees the token.
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
       - name: Update Homebrew tap
         env:
           TAP_REPO: totocaster/homebrew-tap
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ steps.vars.outputs.version }}
-          ARM_URL: ${{ steps.metadata.outputs.arm_url }}
-          ARM_SHA: ${{ steps.metadata.outputs.arm_sha }}
-          INTEL_URL: ${{ steps.metadata.outputs.intel_url }}
-          INTEL_SHA: ${{ steps.metadata.outputs.intel_sha }}
+          VERSION: ${{ needs.release.outputs.version }}
+          ARM_URL: ${{ needs.release.outputs.arm_url }}
+          ARM_SHA: ${{ needs.release.outputs.arm_sha }}
+          INTEL_URL: ${{ needs.release.outputs.intel_url }}
+          INTEL_SHA: ${{ needs.release.outputs.intel_sha }}
         run: |
           set -euo pipefail
 
