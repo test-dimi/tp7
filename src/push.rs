@@ -277,7 +277,32 @@ async fn put_file(
     if let Some(existing) = &destination.existing {
         upload_replacement_file(storage, local_path, destination, existing, size, options).await?;
     } else {
-        upload_file(storage, local_path, destination, size, options).await?;
+        upload_new_file(storage, local_path, destination, size, options).await?;
+    }
+
+    Ok(())
+}
+
+/// Uploads under a temporary name and renames into place only once every
+/// byte has arrived, so an interrupted push (Ctrl-C, a pulled cable) can
+/// never leave a truncated file under the final name.
+async fn upload_new_file(
+    storage: &Storage,
+    local_path: &Path,
+    destination: &RemoteDestination,
+    size: u64,
+    options: PushOptions,
+) -> Result<(), AppError> {
+    let temporary = unique_temp_destination(storage, destination, "upload").await?;
+    let handle = upload_file(storage, local_path, &temporary, size, options).await?;
+
+    if let Err(error) = storage
+        .rename(handle, &destination.name)
+        .await
+        .map_err(map_mtp_error)
+    {
+        cleanup_uploaded_temp(storage, handle).await;
+        return Err(error);
     }
 
     Ok(())
